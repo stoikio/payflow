@@ -1,0 +1,5 @@
+FROM node:24-slim
+
+RUN npm install --global pnpm@12.14.0
+
+WORKDIR /app

@@ -1,0 +1,445 @@
+# PayFlow API reference
+
+PayFlow collects payments by bank debit (SEPA Core). A payer authorizes a **mandate** once on a
+PayFlow-hosted page; the merchant then creates **charges** against that mandate. Changes to
+mandates and charges are published as **events** and delivered by **webhook**.
+
+- [Basics](#basics): base URL, authentication, errors, rate limits, idempotency, pagination
+- [Mandates](#mandates)
+- [Charges](#charges)
+- [Failure codes](#failure-codes)
+- [Events and webhooks](#events-and-webhooks)
+- [Testing](#testing): sandbox IBANs, accelerated time, chaos mode, sandbox endpoints, dashboard
+
+## Basics
+
+### Base URL
+
+```
+http://localhost:4010
+```
+
+All request and response bodies are JSON (`Content-Type: application/json`). Amounts are integers
+in the currency's minor unit (cents). Timestamps are ISO 8601 in UTC, dates are `YYYY-MM-DD`.
+
+### Authentication
+
+Every API request carries the secret API key as a bearer token:
+
+```
+Authorization: Bearer sk_sandbox_9f3c2e7a41b84d6f
+```
+
+A missing or wrong key returns `401` with `authentication_error`. The hosted authorization page
+and the dashboard do not use the key.
+
+### Errors
+
+Errors use conventional HTTP status codes and a common body:
+
+```json
+{
+  "error": {
+    "type": "invalid_request_error",
+    "code": "mandate_not_active",
+    "message": "Mandate MD7Q2V0K8B5N3XHT is cancelled",
+    "param": "mandateId"
+  }
+}
+```
+
+| Status | `type`                  | Meaning                                                   |
+| ------ | ----------------------- | --------------------------------------------------------- |
+| 400    | `invalid_request_error` | Malformed request: invalid JSON, missing or invalid field |
+| 401    | `authentication_error`  | Missing or invalid API key                                |
+| 404    | `invalid_request_error` | Unknown resource (`resource_missing`) or route            |
+| 422    | `invalid_request_error` | Valid request refused in the current state                |
+| 429    | `rate_limit_error`      | Rate limit exceeded                                       |
+| 500    | `api_error`             | Error on PayFlow's side                                   |
+
+`param` names the offending field when there is one. Some errors carry extra fields, such as
+`earliestChargeDate` on `charge_date_too_early`.
+
+### Rate limits
+
+100 requests per second per API key. Every API response carries `RateLimit-Limit` and
+`RateLimit-Remaining`. Over the limit, PayFlow answers `429` with a `Retry-After` header in
+seconds.
+
+### Idempotency
+
+`POST /charges` requires an `Idempotency-Key` header (1 to 255 characters).
+
+- The same key with the same body within 24 hours returns the original response, with the same
+  charge, and the header `Idempotent-Replayed: true`. No new charge is created.
+- The same key with a different body returns `422 idempotency_key_reused`.
+- Only successful responses are stored: a request refused with a `4xx` can be retried with the
+  same key.
+
+### Pagination
+
+List endpoints return the newest objects first:
+
+```json
+{ "data": [ ... ], "hasMore": true }
+```
+
+| Query parameter | Description                                             |
+| --------------- | ------------------------------------------------------- |
+| `limit`         | 1 to 100, default 20                                    |
+| `startingAfter` | Id of the last object of the previous page              |
+
+## Mandates
+
+A mandate is the payer's authorization to debit their bank account.
+
+### The mandate object
+
+```json
+{
+  "id": "MD7Q2V0K8B5N3XHT",
+  "customerReference": "client-0042",
+  "status": "active",
+  "authorizationUrl": "http://localhost:4010/authorize/2y8yQ0bS3n1Q...",
+  "returnUrl": "https://merchant.example/debit/return",
+  "bankAccount": { "accountHolderName": "Jane Doe", "country": "NL", "ibanLast4": "0001" },
+  "failureCode": null,
+  "cancellationReason": null,
+  "metadata": {},
+  "createdAt": "2026-10-22T09:00:00.000Z",
+  "updatedAt": "2026-10-22T09:00:05.000Z"
+}
+```
+
+| Field                | Description                                                              |
+| -------------------- | ------------------------------------------------------------------------ |
+| `customerReference`  | Your reference for the payer, as sent on creation                        |
+| `status`             | See below                                                                |
+| `authorizationUrl`   | Hosted page where the payer enters their IBAN and confirms               |
+| `bankAccount`        | `null` until the payer confirmed                                         |
+| `failureCode`        | Set when `status` is `failed`: `invalid_bank_details`                    |
+| `cancellationReason` | Set when `status` is `cancelled`: `cancelled_by_merchant`, `cancelled_by_payer`, `bank_account_closed` |
+| `metadata`           | Up to 20 string key-value pairs                                          |
+
+| Status                      | Meaning                                                          |
+| --------------------------- | ---------------------------------------------------------------- |
+| `pending_customer_approval` | Created, the payer has not confirmed the hosted page yet         |
+| `pending_submission`        | Confirmed by the payer, being set up with the payer's bank       |
+| `active`                    | Charges can be created                                           |
+| `failed`                    | The payer's bank refused the mandate. Final                      |
+| `cancelled`                 | No new charge possible. Final                                    |
+
+```
+pending_customer_approval -> pending_submission -> active -> cancelled
+                                                \-> failed
+```
+
+A mandate can be cancelled from any non-final status. Cancelling a mandate fails its charges in
+`pending_submission` or `submitted` with `mandate_cancelled`.
+
+### Create a mandate
+
+`POST /mandates`
+
+| Body field          | Type   | Required | Description                         |
+| ------------------- | ------ | -------- | ----------------------------------- |
+| `customerReference` | string | yes      | 1 to 100 characters                 |
+| `returnUrl`         | URL    | yes      | Where the payer is sent after confirming |
+| `metadata`          | object | no       | String values                       |
+
+```sh
+curl -X POST http://localhost:4010/mandates \
+  -H "Authorization: Bearer $PAYFLOW_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "customerReference": "client-0042", "returnUrl": "https://merchant.example/debit/return" }'
+```
+
+Returns `201` with the mandate, in `pending_customer_approval`.
+
+### Hosted authorization page
+
+Send the payer to `authorizationUrl`. The page asks for the account holder name and the IBAN.
+On confirmation the mandate moves to `pending_submission` and the payer's browser is redirected
+(`303`) to `returnUrl` with the mandate id added to the query string:
+
+```
+https://merchant.example/debit/return?mandateId=MD7Q2V0K8B5N3XHT
+```
+
+An authorization link can be used once. The redirect does not mean the mandate is active.
+
+### Retrieve a mandate
+
+`GET /mandates/{id}`
+
+### List mandates
+
+`GET /mandates?customerReference=client-0042`
+
+Optional filter `customerReference`, plus pagination parameters.
+
+### Cancel a mandate
+
+`POST /mandates/{id}/cancel`
+
+Returns the mandate with `status: cancelled` and `cancellationReason: cancelled_by_merchant`.
+`422 mandate_not_cancellable` when it is already `failed` or `cancelled`.
+
+## Charges
+
+A charge debits an amount from the payer's account on a mandate.
+
+### The charge object
+
+```json
+{
+  "id": "CH3M9R6TQ1W4ZP0D",
+  "mandateId": "MD7Q2V0K8B5N3XHT",
+  "amount": 12000,
+  "currency": "EUR",
+  "chargeDate": "2026-10-27",
+  "description": "Annual premium",
+  "metadata": {},
+  "status": "pending_submission",
+  "failureCode": null,
+  "createdAt": "2026-10-22T09:00:10.000Z",
+  "updatedAt": "2026-10-22T09:00:10.000Z"
+}
+```
+
+| Status               | Meaning                                                               |
+| -------------------- | --------------------------------------------------------------------- |
+| `pending_submission` | Created, waiting to be sent to the banking network. Can be cancelled  |
+| `submitted`          | Sent to the payer's bank                                              |
+| `confirmed`          | Collected from the payer's account                                    |
+| `paid_out`           | Paid out to the merchant's account                                    |
+| `failed`             | Not collected. `failureCode` says why, and may be `null`. Final       |
+| `charged_back`       | The payer disputed a collected charge with their bank. Final          |
+| `cancelled`          | Cancelled before submission. Final                                    |
+
+```
+pending_submission -> submitted -> confirmed -> paid_out
+        |                 |            |           |
+        v                 v            v           v
+    cancelled          failed     charged_back  charged_back
+```
+
+### Timings
+
+| Step                          | Live timing                                                     |
+| ----------------------------- | --------------------------------------------------------------- |
+| `chargeDate`                  | At least 3 business days after the request (Monday to Friday)   |
+| `submitted`                   | On the business day before `chargeDate`                         |
+| `confirmed` or `failed`       | 2 to 5 business days after `chargeDate`                         |
+| `paid_out`                    | 1 to 2 business days after `confirmed`                          |
+| `charged_back`                | Up to 8 weeks after `confirmed`, including after `paid_out`     |
+
+The sandbox replaces these timings, see [Accelerated time](#accelerated-time).
+
+### Create a charge
+
+`POST /charges`
+
+| Header            | Required | Description                     |
+| ----------------- | -------- | ------------------------------- |
+| `Idempotency-Key` | yes      | See [Idempotency](#idempotency) |
+
+| Body field    | Type    | Required | Description                                                   |
+| ------------- | ------- | -------- | ------------------------------------------------------------- |
+| `mandateId`   | string  | yes      | An `active` mandate                                           |
+| `amount`      | integer | yes      | Minor units, 1 to 50,000,000                                  |
+| `currency`    | string  | yes      | `EUR`                                                         |
+| `chargeDate`  | date    | no       | Defaults to the earliest possible date                        |
+| `description` | string  | no       | Up to 140 characters, shown on the payer's bank statement     |
+| `metadata`    | object  | no       | String values                                                 |
+
+```sh
+curl -X POST http://localhost:4010/charges \
+  -H "Authorization: Bearer $PAYFLOW_API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 5d2b0c8e-8f43-4a8e-9a43-0f6f7e2f1c11" \
+  -d '{ "mandateId": "MD7Q2V0K8B5N3XHT", "amount": 12000, "currency": "EUR" }'
+```
+
+Returns `201` with the charge, in `pending_submission`.
+
+| Error code                | Status | When                                                        |
+| ------------------------- | ------ | ----------------------------------------------------------- |
+| `idempotency_key_missing` | 400    | No `Idempotency-Key` header                                 |
+| `validation_failed`       | 400    | A field is missing or invalid                               |
+| `resource_missing`        | 404    | Unknown `mandateId`                                         |
+| `mandate_not_active`      | 422    | The mandate is not `active`                                 |
+| `unsupported_currency`    | 422    | `currency` is not `EUR`                                     |
+| `charge_date_too_early`   | 422    | `chargeDate` is before `earliestChargeDate` (in the error)  |
+| `idempotency_key_reused`  | 422    | Same key, different body                                    |
+
+### Retrieve a charge
+
+`GET /charges/{id}`
+
+### List charges
+
+`GET /charges?mandateId=MD7Q2V0K8B5N3XHT`
+
+Optional filter `mandateId`, plus pagination parameters.
+
+### Cancel a charge
+
+`POST /charges/{id}/cancel`
+
+Only in `pending_submission`. Otherwise `422 charge_not_cancellable`.
+
+## Failure codes
+
+`failureCode` on a `failed` charge:
+
+| Code                 | Meaning                                                                  | Retryable |
+| -------------------- | ------------------------------------------------------------------------ | --------- |
+| `insufficient_funds` | The payer's account did not have enough funds                            | Yes       |
+| `account_closed`     | The payer's account is closed. The mandate is cancelled as well          | No        |
+| `mandate_cancelled`  | The mandate was cancelled before the charge was collected                | No        |
+| `refer_to_payer`     | The payer's bank refused the debit without giving a reason               | No        |
+| `null`               | The bank returned the debit without a reason code                        | No        |
+
+A retry is a new charge on the same mandate, with a new `Idempotency-Key`.
+
+## Events and webhooks
+
+### The event object
+
+```json
+{
+  "id": "EV0B4K7N2Q9T5W8X",
+  "type": "charge.confirmed",
+  "createdAt": "2026-10-22T09:00:25.000Z",
+  "resourceType": "charge",
+  "data": { "id": "CH3M9R6TQ1W4ZP0D", "status": "confirmed", "...": "..." }
+}
+```
+
+`data` is the full mandate or charge as it was when the event happened.
+
+| Type                  | Sent when a ...                       |
+| --------------------- | ------------------------------------- |
+| `mandate.active`      | mandate becomes `active`              |
+| `mandate.failed`      | mandate becomes `failed`              |
+| `mandate.cancelled`   | mandate becomes `cancelled`           |
+| `charge.submitted`    | charge becomes `submitted`            |
+| `charge.confirmed`    | charge becomes `confirmed`            |
+| `charge.paid_out`     | charge becomes `paid_out`             |
+| `charge.failed`       | charge becomes `failed`               |
+| `charge.charged_back` | charge becomes `charged_back`         |
+| `charge.cancelled`    | charge becomes `cancelled`            |
+
+Events are also available from the API:
+
+- `GET /events` with optional filters `type` and `resourceId`, plus pagination parameters
+- `GET /events/{id}`
+
+### Delivery
+
+Each event is `POST`ed as JSON to the webhook URL configured for the account (`WEBHOOK_URL`).
+
+| Header              | Value                                          |
+| ------------------- | ---------------------------------------------- |
+| `Content-Type`      | `application/json`                             |
+| `User-Agent`        | `PayFlow-Webhooks/1.0`                         |
+| `PayFlow-Event-Id`  | The event id                                   |
+| `PayFlow-Signature` | `t=<unix seconds>,v1=<hex signature>`          |
+
+- Delivery is **at least once**: an event can be delivered more than once.
+- **Order is not guaranteed**, including between events of the same resource.
+- A delivery succeeds when the receiver answers `2xx` within 10 seconds. Anything else is
+  retried.
+
+### Retries
+
+Failed deliveries are retried with backoff for up to 72 hours, 9 attempts in total:
+
+| Attempt | Delay after the previous attempt |
+| ------- | -------------------------------- |
+| 2       | 1 minute                         |
+| 3       | 5 minutes                        |
+| 4       | 30 minutes                       |
+| 5       | 2 hours                          |
+| 6       | 6 hours                          |
+| 7       | 12 hours                         |
+| 8       | 24 hours                         |
+| 9       | 24 hours                         |
+
+After the last attempt the delivery is marked `failed`. The event stays available from
+`GET /events`.
+
+### Signatures
+
+`PayFlow-Signature` is computed with the webhook signing secret (`WEBHOOK_SECRET`):
+
+```
+t  = unix timestamp in seconds, at sending time
+v1 = hex(HMAC-SHA256(secret, t + "." + raw request body))
+```
+
+To verify: split the header on `,` and `=`, compute `v1` over the raw body exactly as received,
+compare in constant time, and check that `t` is within 5 minutes of the current time.
+
+```js
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+const verify = (rawBody, header, secret) => {
+  const { t, v1 } = Object.fromEntries(header.split(',').map((part) => part.split('=')));
+  const expected = createHmac('sha256', secret).update(`${t}.${rawBody}`).digest('hex');
+  const fresh = Math.abs(Date.now() / 1000 - Number(t)) <= 300;
+  return fresh && v1?.length === expected.length && timingSafeEqual(Buffer.from(v1), Buffer.from(expected));
+};
+```
+
+## Testing
+
+This server is the sandbox: no money moves, and outcomes depend on the IBAN used on the hosted
+page.
+
+### Sandbox IBANs
+
+| IBAN                 | Outcome                                                                                 |
+| -------------------- | --------------------------------------------------------------------------------------- |
+| `NL19PAYF0000000001` | Mandate `active`; every charge reaches `paid_out`. Any other valid IBAN behaves the same |
+| `NL89PAYF0000000002` | Every charge `failed` with `insufficient_funds`                                         |
+| `NL62PAYF0000000003` | First charge `failed` with `insufficient_funds`, later charges reach `paid_out`         |
+| `NL35PAYF0000000004` | Charge `failed` with `account_closed`, then mandate `cancelled` (`bank_account_closed`) |
+| `NL08PAYF0000000005` | Every charge `failed` with `refer_to_payer`                                             |
+| `NL78PAYF0000000006` | Every charge `failed` with `failureCode: null`                                          |
+| `NL51PAYF0000000007` | Charge reaches `paid_out`, then `charged_back`                                          |
+| `NL24PAYF0000000008` | Mandate `failed` with `invalid_bank_details`                                            |
+| `NL94PAYF0000000009` | Mandate `active`, then `cancelled` by the payer (`cancelled_by_payer`)                  |
+
+Invalid IBANs (wrong checksum or format) are refused on the hosted page.
+
+### Accelerated time
+
+In the sandbox each state transition happens `SANDBOX_TRANSITION_SECONDS` (default 5) seconds
+after the previous one, whatever the `chargeDate`. `chargeDate` is still validated against the
+3 business day rule.
+
+The webhook retry schedule is compressed: `WEBHOOK_RETRY_SECONDS_PER_HOUR` (default 1) seconds
+per hour of the live schedule, at least 1 second between attempts. With the default, the full
+72 hour window lasts about 70 seconds. Set it to `3600` for live timings.
+
+### Chaos mode
+
+With `WEBHOOK_CHAOS=true`, each delivery is delayed by up to 8 seconds, which reorders events,
+and about one event in three is delivered twice.
+
+### Sandbox endpoints
+
+These require the API key.
+
+| Endpoint                                   | Effect                                                                      |
+| ------------------------------------------ | --------------------------------------------------------------------------- |
+| `POST /sandbox/charges/{id}/transition`    | Moves a charge to `status` now (body `{ "status": "failed", "failureCode": "insufficient_funds" }`). Must be an allowed transition. The charge then continues on its normal path |
+| `POST /sandbox/mandates/{id}/cancel`       | Cancels a mandate as if the payer did it at their bank (`cancelled_by_payer`) |
+| `POST /sandbox/events/{id}/replay`         | Delivers an event again to the webhook URL                                  |
+
+### Dashboard
+
+`GET /dashboard` lists mandates, charges and webhook deliveries with their attempts and status.
+Read only, refreshes every 3 seconds.
