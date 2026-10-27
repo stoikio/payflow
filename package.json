@@ -1,0 +1,32 @@
+{
+  "name": "payflow-sandbox",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.14.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "imports": {
+    "#src/*": "./src/*"
+  },
+  "scripts": {
+    "dev": "node --watch --watch-path=src --disable-warning=ExperimentalWarning src/main.ts",
+    "start": "node --disable-warning=ExperimentalWarning src/main.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --project tsconfig.json",
+    "lint": "oxlint --config .oxlintrc.json src",
+    "format": "oxfmt src"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.5",
+    "hono": "^4.13.13",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "oxfmt": "^0.74.0",
+    "oxlint": "^1.89.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  }
+}
