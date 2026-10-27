@@ -7,6 +7,7 @@ mandates and charges are published as **events** and delivered by **webhook**.
 This reference is also served by the sandbox at
 [http://localhost:4010/docs](http://localhost:4010/docs).
 
+- [TL;DR](#tldr)
 - [Basics](#basics): base URL, authentication, errors, rate limits, idempotency, pagination
 - [Mandates](#mandates)
 - [Charges](#charges)
@@ -14,6 +15,46 @@ This reference is also served by the sandbox at
 - [Events and webhooks](#events-and-webhooks): event types, delivery, retries, signatures
 - [Webhook deliveries](#webhook-deliveries)
 - [Testing](#testing): sandbox IBANs, accelerated time, chaos mode, sandbox endpoints, dashboard
+
+## TL;DR
+
+- **Base URL:** `http://localhost:4010`. JSON in and out. Amounts in cents, dates in UTC.
+- **Auth:** `Authorization: Bearer sk_sandbox_9f3c2e7a41b84d6f` on every API call. `/docs`, `/dashboard` and the hosted authorization page need no key.
+- **Flow:** create a mandate, send the payer to its `authorizationUrl`, then create charges once the mandate is `active`. Every status change is published as an event and POSTed to your webhook.
+- **Webhooks:** signed with `PayFlow-Signature`, delivered at least once, in no guaranteed order. Secret: `whsec_sandbox_5d1e8b3a9c7f4026`.
+- **Sandbox:** no money moves. A status changes every 5 seconds, whatever the dates.
+
+| Route                                   | Purpose                                              |
+| --------------------------------------- | ---------------------------------------------------- |
+| `POST /mandates`                        | Create a mandate, returns the `authorizationUrl`     |
+| `GET /mandates/{id}`                    | Retrieve a mandate and its status                    |
+| `POST /mandates/{id}/cancel`            | Cancel a mandate                                     |
+| `POST /charges`                         | Create a charge (`Idempotency-Key` header required)  |
+| `GET /charges/{id}`                     | Retrieve a charge and its status                     |
+| `POST /charges/{id}/cancel`             | Cancel a charge still in `pending_submission`         |
+| `GET /events`                           | List events                                          |
+| `GET /events/{id}/deliveries`           | List the webhook deliveries of an event              |
+| `POST /sandbox/events/{id}/replay`      | Send an event again                                  |
+| `POST /sandbox/charges/{id}/transition` | Force a charge to a given status                     |
+
+Events: `mandate.active`, `mandate.failed`, `mandate.cancelled`, `charge.submitted`,
+`charge.confirmed`, `charge.paid_out`, `charge.failed`, `charge.charged_back`, `charge.cancelled`.
+
+The outcome of a mandate and of its charges depends on the IBAN entered on the hosted page:
+
+| IBAN                 | Outcome                                           |
+| -------------------- | ------------------------------------------------- |
+| `NL19PAYF0000000001` | Every charge reaches `paid_out`                   |
+| `NL89PAYF0000000002` | Every charge fails with `insufficient_funds`      |
+| `NL62PAYF0000000003` | First charge fails, the next ones reach `paid_out`|
+| `NL35PAYF0000000004` | Charge fails with `account_closed`, mandate cancelled |
+| `NL08PAYF0000000005` | Every charge fails with `refer_to_payer`          |
+| `NL78PAYF0000000006` | Every charge fails with no failure code           |
+| `NL51PAYF0000000007` | Charge is paid out, then `charged_back`           |
+| `NL24PAYF0000000008` | The mandate itself fails                          |
+| `NL94PAYF0000000009` | Mandate is cancelled by the payer after activation|
+
+Details: [Testing](#testing).
 
 ## Basics
 
