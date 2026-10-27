@@ -6,7 +6,7 @@ import { z } from 'zod';
 import { ChargeStatus } from '#src/domain/types.ts';
 import type { PaymentService } from '#src/engine/payments.ts';
 import { ApiError, notFound } from '#src/lib/errors.ts';
-import { serializeEvent } from '#src/engine/webhooks.ts';
+import { publicDelivery, serializeEvent } from '#src/engine/webhooks.ts';
 import type { Store } from '#src/store/store.ts';
 
 import { jsonBody, listResponse, Metadata, Pagination, parse } from './validation.ts';
@@ -159,6 +159,26 @@ export const apiRoutes = ({
       throw notFound('event', c.req.param('id'));
     }
     return c.json(JSON.parse(serializeEvent(event)));
+  });
+
+  router.get('/events/:id/deliveries', (c) => {
+    const query = parse(Pagination, c.req.query());
+    const event = store.findEvent(c.req.param('id'));
+    if (!event) {
+      throw notFound('event', c.req.param('id'));
+    }
+    const deliveries = store.listEventDeliveries(event.id, {
+      ...query,
+      limit: query.limit + 1,
+    });
+    return c.json(
+      listResponse(
+        deliveries.map((delivery) =>
+          publicDelivery(delivery, store.listAttempts(delivery.id)),
+        ),
+        query.limit,
+      ),
+    );
   });
 
   router.post('/sandbox/charges/:id/transition', async (c) => {

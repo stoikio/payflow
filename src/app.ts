@@ -1,5 +1,8 @@
 import { Hono } from 'hono';
+import { csrf } from 'hono/csrf';
+import { HTTPException } from 'hono/http-exception';
 import { logger } from 'hono/logger';
+import { z } from 'zod';
 
 import { apiRoutes } from '#src/api/routes.ts';
 import { rateLimit, requireApiKey } from '#src/api/middleware.ts';
@@ -9,8 +12,14 @@ import { WebhookDispatcher } from '#src/engine/webhooks.ts';
 import { ApiError } from '#src/lib/errors.ts';
 import { authorizePage, messagePage } from '#src/pages/authorize-page.ts';
 import { dashboardPage } from '#src/pages/dashboard-page.ts';
+import { deliveryPage } from '#src/pages/delivery-page.ts';
+import { docsPage } from '#src/pages/docs-page.ts';
 import type { Database } from '#src/store/database.ts';
-import { Store } from '#src/store/store.ts';
+import { DELIVERY_STATES, Store } from '#src/store/store.ts';
+
+const DashboardQuery = z.object({
+  deliveries: z.enum(DELIVERY_STATES).optional().catch(undefined),
+});
 
 export type AppOptions = {
   database: Database;
@@ -41,6 +50,9 @@ export const createApp = ({
   app.onError((error, c) => {
     if (error instanceof ApiError) {
       return c.json(error.toJSON(), error.status);
+    }
+    if (error instanceof HTTPException) {
+      return error.getResponse();
     }
     console.error(error);
     return c.json(
@@ -114,8 +126,11 @@ export const createApp = ({
     }
   });
 
+  app.get('/docs', (c) => c.html(docsPage()));
+
   app.get('/dashboard', (c) => {
-    const deliveries = store.listDeliveries(100);
+    const { deliveries: deliveryFilter } = DashboardQuery.parse(c.req.query());
+    const deliveries = store.listDeliveries({ state: deliveryFilter }, 100);
     const events = new Map(
       deliveries.flatMap((delivery) => {
         const event = store.findEvent(delivery.eventId);
@@ -128,10 +143,45 @@ export const createApp = ({
         charges: store.listCharges({}, { limit: 100 }),
         events,
         deliveries,
+        deliveryCounts: store.countDeliveries(),
+        deliveryFilter,
         webhookUrl: config.webhookUrl,
         chaos: config.webhookChaos,
       }),
     );
+  });
+
+  app.get('/dashboard/deliveries/:id', (c) => {
+    const delivery = store.findDelivery(c.req.param('id'));
+    const event = delivery ? store.findEvent(delivery.eventId) : null;
+    if (!delivery || !event) {
+      return c.html(
+        messagePage('Delivery not found', 'This delivery does not exist.'),
+        404,
+      );
+    }
+    return c.html(
+      deliveryPage({
+        delivery,
+        event,
+        attempts: store.listAttempts(delivery.id),
+        otherDeliveries: store
+          .listEventDeliveries(event.id, { limit: 100 })
+          .filter((other) => other.id !== delivery.id),
+      }),
+    );
+  });
+
+  app.post('/dashboard/deliveries/:id/replay', csrf(), (c) => {
+    const delivery = store.findDelivery(c.req.param('id'));
+    if (!delivery) {
+      return c.html(
+        messagePage('Delivery not found', 'This delivery does not exist.'),
+        404,
+      );
+    }
+    const replayed = payments.replayEvent(delivery.eventId);
+    return c.redirect(`/dashboard/deliveries/${replayed.id}`, 303);
   });
 
   const api = new Hono();

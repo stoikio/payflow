@@ -11,7 +11,14 @@ const SECRET = 'whsec_test_0123456789';
 
 type Received = { body: string; headers: Headers };
 
-const setup = ({ webhookStatus = 200, rateLimit = 100 } = {}) => {
+/** Answers a webhook request, or throws to simulate a network error. */
+type Receiver = (request: Received) => Response;
+
+const setup = ({
+  webhookStatus = 200,
+  rateLimit = 100,
+  receiver,
+}: { webhookStatus?: number; rateLimit?: number; receiver?: Receiver } = {}) => {
   let clock = new Date('2026-10-22T09:00:00.000Z').getTime();
   const received: Received[] = [];
   const config = loadConfig({
@@ -22,8 +29,9 @@ const setup = ({ webhookStatus = 200, rateLimit = 100 } = {}) => {
     RATE_LIMIT_PER_SECOND: String(rateLimit),
   });
   const fakeFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
-    received.push({ body: String(init?.body), headers: new Headers(init?.headers) });
-    return new Response(null, { status: webhookStatus });
+    const request = { body: String(init?.body), headers: new Headers(init?.headers) };
+    received.push(request);
+    return receiver ? receiver(request) : new Response(null, { status: webhookStatus });
   }) as typeof fetch;
   const { app, tick } = createApp({
     database: openDatabase(':memory:'),
@@ -371,5 +379,245 @@ describe('PayFlow sandbox webhooks and limits', () => {
 
     expect(statuses.map((response) => response.status)).toEqual([200, 200, 429]);
     expect(statuses[2]?.headers.get('retry-after')).toBe('1');
+  });
+});
+
+type PublicAttempt = {
+  url: string;
+  signature: string;
+  statusCode: number | null;
+  error: string | null;
+  responseBody: string | null;
+};
+type PublicDelivery = {
+  id: string;
+  eventId: string;
+  status: string;
+  nextAttemptAt: string | null;
+  attempts: PublicAttempt[];
+};
+
+const connectionRefused = () =>
+  new TypeError('fetch failed', {
+    cause: new AggregateError(
+      [
+        new Error('connect ECONNREFUSED ::1:3000'),
+        new Error('connect ECONNREFUSED 127.0.0.1:3000'),
+      ],
+      '',
+    ),
+  });
+
+const mandateActiveEventId = async (sandbox: ReturnType<typeof setup>) => {
+  const events = await sandbox.call<{ data: { id: string }[] }>(
+    'GET',
+    '/events?type=mandate.active',
+  );
+  return events.body.data[0]?.id ?? '';
+};
+
+const deliveriesOf = (sandbox: ReturnType<typeof setup>, eventId: string, query = '') =>
+  sandbox.call<{ data: PublicDelivery[]; hasMore: boolean }>(
+    'GET',
+    `/events/${eventId}/deliveries${query}`,
+  );
+
+const html = async (sandbox: ReturnType<typeof setup>, path: string) => {
+  const response = await sandbox.app.request(path);
+  return { status: response.status, text: await response.text() };
+};
+
+describe('PayFlow sandbox webhook deliveries', () => {
+  it('stores every attempt with its URL, signature, result and response body', async () => {
+    let attempt = 0;
+    const sandbox = setup({
+      receiver: () => {
+        attempt++;
+        if (attempt === 1) {
+          throw connectionRefused();
+        }
+        return attempt === 2
+          ? new Response('x'.repeat(3000), { status: 500 })
+          : new Response('ok', { status: 200 });
+      },
+    });
+    await sandbox.activeMandate(MAGIC_IBANS.success);
+    await sandbox.advance(3);
+
+    const deliveries = await deliveriesOf(sandbox, await mandateActiveEventId(sandbox));
+    const [delivery] = deliveries.body.data;
+
+    expect(deliveries.body.hasMore).toBe(false);
+    expect(delivery).toMatchObject({ status: 'delivered', nextAttemptAt: null });
+    expect(delivery?.attempts).toEqual([
+      expect.objectContaining({
+        url: 'http://receiver.test/webhooks',
+        statusCode: null,
+        error: 'connect ECONNREFUSED ::1:3000; connect ECONNREFUSED 127.0.0.1:3000',
+        responseBody: null,
+      }),
+      expect.objectContaining({
+        statusCode: 500,
+        error: null,
+        responseBody: 'x'.repeat(2048),
+      }),
+      expect.objectContaining({ statusCode: 200, error: null, responseBody: 'ok' }),
+    ]);
+    expect(delivery?.attempts.map((stored) => stored.signature)).toEqual(
+      sandbox.received.map(({ headers }) => headers.get('payflow-signature')),
+    );
+  });
+
+  it('lists the deliveries of an event, newest first and paginated', async () => {
+    const sandbox = setup();
+    await sandbox.activeMandate(MAGIC_IBANS.success);
+    const eventId = await mandateActiveEventId(sandbox);
+    const replay = await sandbox.call<{ deliveryId: string }>(
+      'POST',
+      `/sandbox/events/${eventId}/replay`,
+    );
+    await sandbox.advance(1);
+
+    const all = await deliveriesOf(sandbox, eventId);
+    const firstPage = await deliveriesOf(sandbox, eventId, '?limit=1');
+    const secondPage = await deliveriesOf(
+      sandbox,
+      eventId,
+      `?limit=1&startingAfter=${firstPage.body.data[0]?.id}`,
+    );
+
+    expect(all.body.data.map((delivery) => delivery.status)).toEqual([
+      'delivered',
+      'delivered',
+    ]);
+    expect(firstPage.body).toMatchObject({
+      hasMore: true,
+      data: [{ id: replay.body.deliveryId, eventId }],
+    });
+    expect(secondPage.body.hasMore).toBe(false);
+    expect(secondPage.body.data[0]?.id).toBe(all.body.data[1]?.id);
+  });
+
+  it('requires the API key and a known event to list deliveries', async () => {
+    const sandbox = setup();
+    const unauthenticated = await sandbox.app.request('/events/EVUNKNOWN/deliveries');
+    const unknown = await deliveriesOf(sandbox, 'EVUNKNOWN');
+
+    expect(unauthenticated.status).toBe(401);
+    expect(unknown.status).toBe(404);
+    expect(unknown.body).toMatchObject({ error: { code: 'resource_missing' } });
+  });
+
+  it('filters the dashboard deliveries by status', async () => {
+    let answer = 500;
+    const sandbox = setup({ receiver: () => new Response(null, { status: answer }) });
+    await sandbox.activeMandate(MAGIC_IBANS.success);
+    await sandbox.advance(80);
+    const eventId = await mandateActiveEventId(sandbox);
+    answer = 200;
+    const delivered = await sandbox.call<{ deliveryId: string }>(
+      'POST',
+      `/sandbox/events/${eventId}/replay`,
+    );
+    await sandbox.advance(1);
+    answer = 503;
+    const pending = await sandbox.call<{ deliveryId: string }>(
+      'POST',
+      `/sandbox/events/${eventId}/replay`,
+    );
+    await sandbox.advance(1);
+    const failedId =
+      (await deliveriesOf(sandbox, eventId)).body.data.find(
+        (delivery) => delivery.status === 'failed',
+      )?.id ?? '';
+
+    const listed = async (filter: string) => {
+      const page = await html(sandbox, `/dashboard${filter}`);
+      return [failedId, delivered.body.deliveryId, pending.body.deliveryId].filter((id) =>
+        page.text.includes(`/dashboard/deliveries/${id}"`),
+      );
+    };
+
+    expect(await listed('')).toEqual([
+      failedId,
+      delivered.body.deliveryId,
+      pending.body.deliveryId,
+    ]);
+    expect(await listed('?deliveries=failed')).toEqual([failedId]);
+    expect(await listed('?deliveries=delivered')).toEqual([delivered.body.deliveryId]);
+    expect(await listed('?deliveries=pending')).toEqual([pending.body.deliveryId]);
+    expect(await listed('?deliveries=unknown')).toHaveLength(3);
+
+    const dashboard = await html(sandbox, '/dashboard?deliveries=failed');
+    expect(dashboard.text).toContain('Failed 1</a>');
+    expect(dashboard.text).toContain('Pending 1</a>');
+    expect(dashboard.text).toContain('Delivered 1</a>');
+    expect(dashboard.text).toContain('<tr class="failed">');
+  });
+
+  it('shows a delivery with its payload, signature and attempts, and replays it', async () => {
+    const sandbox = setup({
+      receiver: () => {
+        throw connectionRefused();
+      },
+    });
+    await sandbox.activeMandate(MAGIC_IBANS.success);
+    await sandbox.advance(1);
+    const eventId = await mandateActiveEventId(sandbox);
+    const [delivery] = (await deliveriesOf(sandbox, eventId)).body.data;
+    const path = `/dashboard/deliveries/${delivery?.id}`;
+
+    const page = await html(sandbox, path);
+
+    expect(page.status).toBe(200);
+    expect(page.text).toContain(eventId);
+    expect(page.text).toContain('&quot;type&quot;: &quot;mandate.active&quot;');
+    expect(page.text).toContain(
+      `PayFlow-Signature: ${delivery?.attempts.at(-1)?.signature}`,
+    );
+    expect(page.text.match(/connect ECONNREFUSED 127\.0\.0\.1:3000/g)).toHaveLength(3);
+    expect(page.text).toContain(`action="${path}/replay"`);
+
+    const crossSite = await sandbox.app.request(`${path}/replay`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        origin: 'http://evil.test',
+      },
+    });
+    const replayed = await sandbox.app.request(`${path}/replay`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        origin: 'http://localhost',
+      },
+    });
+    const deliveries = (await deliveriesOf(sandbox, eventId)).body.data;
+
+    expect(crossSite.status).toBe(403);
+    expect(replayed.status).toBe(303);
+    expect(deliveries).toHaveLength(2);
+    expect(replayed.headers.get('location')).toBe(
+      `/dashboard/deliveries/${deliveries[0]?.id}`,
+    );
+    expect((await html(sandbox, '/dashboard/deliveries/WDUNKNOWN')).status).toBe(404);
+  });
+});
+
+describe('PayFlow sandbox documentation', () => {
+  it('serves the API reference without the API key, every internal link resolving', async () => {
+    const sandbox = setup();
+    const page = await html(sandbox, '/docs');
+    const ids = new Set(
+      [...page.text.matchAll(/ id="([^"]+)"/g)].map((match) => match[1]),
+    );
+    const anchors = [...page.text.matchAll(/href="#([^"]+)"/g)].map((match) => match[1]);
+
+    expect(page.status).toBe(200);
+    expect(page.text).toContain('<title>PayFlow API reference</title>');
+    expect(page.text).toContain('<a href="/docs" aria-current="page">Docs</a>');
+    expect(page.text).toContain('<table>');
+    expect(anchors).toContain('webhook-deliveries');
+    expect(anchors.filter((anchor) => !ids.has(anchor))).toEqual([]);
   });
 });

@@ -1,27 +1,63 @@
 import type { Charge, Mandate } from '#src/domain/types.ts';
-import type { Delivery, StoredEvent } from '#src/store/store.ts';
+import { MAX_ATTEMPTS } from '#src/engine/retry-schedule.ts';
+import {
+  type Delivery,
+  type DeliveryState,
+  deliveryState,
+  DELIVERY_STATES,
+  type StoredEvent,
+} from '#src/store/store.ts';
 
-import { escape, layout } from './html.ts';
+import { escape, layout, status, table, time } from './html.ts';
 
-const status = (value: string) =>
-  `<span class="status ${escape(value)}">${escape(value)}</span>`;
-const time = (value: string | number | null) =>
-  value === null
-    ? ''
-    : escape(new Date(value).toISOString().replace('T', ' ').slice(0, 19));
+export const lastResult = (delivery: Delivery) =>
+  delivery.lastStatusCode
+    ? `HTTP ${delivery.lastStatusCode}`
+    : (delivery.lastError ?? '');
 
-const table = (headers: string[], rows: string[][]) =>
-  rows.length === 0
-    ? '<p class="muted">Nothing yet.</p>'
-    : `<table><thead><tr>${headers.map((header) => `<th>${header}</th>`).join('')}</tr></thead><tbody>${rows
-        .map((cells) => `<tr>${cells.map((cell) => `<td>${cell}</td>`).join('')}</tr>`)
-        .join('')}</tbody></table>`;
+const deliveryRowClass = (delivery: Delivery) => {
+  const state = deliveryState(delivery);
+  if (state === 'failed') {
+    return 'failed';
+  }
+  return state === 'pending' && delivery.attemptCount > 0 ? 'retrying' : '';
+};
+
+const FILTER_LABELS: Record<DeliveryState, string> = {
+  failed: 'Failed',
+  pending: 'Pending',
+  delivered: 'Delivered',
+};
+
+const filters = (
+  current: DeliveryState | undefined,
+  counts: Record<DeliveryState, number>,
+) => {
+  const total = DELIVERY_STATES.reduce((sum, state) => sum + counts[state], 0);
+  const options = [
+    { label: 'All', href: '/dashboard#deliveries', count: total, active: !current },
+    ...(['failed', 'pending', 'delivered'] as const).map((state) => ({
+      label: FILTER_LABELS[state],
+      href: `/dashboard?deliveries=${state}#deliveries`,
+      count: counts[state],
+      active: current === state,
+    })),
+  ];
+  return `<nav class="filters" aria-label="Filter deliveries">${options
+    .map(
+      (option) =>
+        `<a href="${option.href}"${option.active ? ' aria-current="true"' : ''}>${option.label} ${option.count}</a>`,
+    )
+    .join('')}</nav>`;
+};
 
 export const dashboardPage = ({
   mandates,
   charges,
   events,
   deliveries,
+  deliveryCounts,
+  deliveryFilter,
   webhookUrl,
   chaos,
 }: {
@@ -29,13 +65,16 @@ export const dashboardPage = ({
   charges: Charge[];
   events: Map<string, StoredEvent>;
   deliveries: Delivery[];
+  deliveryCounts: Record<DeliveryState, number>;
+  deliveryFilter?: DeliveryState;
   webhookUrl: string;
   chaos: boolean;
 }) =>
   layout({
     title: 'PayFlow sandbox dashboard',
     refreshSeconds: 3,
-    body: `<p class="muted">Read only, refreshes every 3 seconds. Webhooks go to <code>${escape(webhookUrl)}</code>${
+    current: 'dashboard',
+    body: `<p class="muted">Refreshes every 3 seconds. Webhooks go to <code>${escape(webhookUrl)}</code>${
       chaos ? ' (chaos mode on)' : ''
     }.</p>
 <h2>Mandates</h2>
@@ -82,7 +121,7 @@ ${table(
     time(charge.updatedAt),
   ]),
 )}
-<h2>Webhook deliveries</h2>
+<div class="section-title" id="deliveries"><h2>Webhook deliveries</h2>${filters(deliveryFilter, deliveryCounts)}</div>
 ${table(
   [
     'Delivery',
@@ -96,20 +135,20 @@ ${table(
   ],
   deliveries.map((delivery) => {
     const event = events.get(delivery.eventId);
+    const state = deliveryState(delivery);
     return [
-      `<code>${escape(delivery.id)}</code>`,
+      `<a href="/dashboard/deliveries/${escape(delivery.id)}"><code>${escape(delivery.id)}</code></a>`,
       `<code>${escape(delivery.eventId)}</code>`,
       escape(event?.type ?? ''),
       `<code>${escape(event?.resourceId ?? '')}</code>`,
-      status(delivery.status),
-      String(delivery.attemptCount),
-      escape(
-        delivery.lastStatusCode
-          ? `HTTP ${delivery.lastStatusCode}`
-          : (delivery.lastError ?? ''),
-      ),
-      time(delivery.status === 'pending' ? delivery.nextAttemptAt : null),
+      status(state),
+      `${delivery.attemptCount} / ${MAX_ATTEMPTS}`,
+      state === 'delivered'
+        ? escape(lastResult(delivery))
+        : `<span class="result-error">${escape(lastResult(delivery))}</span>`,
+      time(state === 'pending' ? delivery.nextAttemptAt : null),
     ];
   }),
+  deliveries.map(deliveryRowClass),
 )}`,
   });

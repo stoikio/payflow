@@ -1,13 +1,20 @@
 import type { Config } from '#src/config.ts';
 import { newId } from '#src/lib/ids.ts';
 import { SIGNATURE_HEADER, signPayload } from '#src/lib/signature.ts';
-import type { Delivery, StoredEvent, Store } from '#src/store/store.ts';
+import {
+  type Attempt,
+  type Delivery,
+  deliveryState,
+  type StoredEvent,
+  type Store,
+} from '#src/store/store.ts';
 
 import { MAX_ATTEMPTS, nextRetryDelayMs } from './retry-schedule.ts';
 
 const TIMEOUT_MS = 10_000;
 const CHAOS_MAX_DELAY_MS = 8_000;
 const CHAOS_DUPLICATE_RATE = 0.3;
+const RESPONSE_BODY_LIMIT_BYTES = 2048;
 
 export type WebhookDispatcherOptions = {
   store: Store;
@@ -28,6 +35,81 @@ export const serializeEvent = (event: StoredEvent) =>
     resourceType: event.resourceType,
     data: event.data,
   });
+
+/** Headers of a webhook request, in the case shown to integrators. */
+export const webhookHeaders = (eventId: string, signature: string) => ({
+  'Content-Type': 'application/json',
+  'User-Agent': 'PayFlow-Webhooks/1.0',
+  'PayFlow-Event-Id': eventId,
+  [SIGNATURE_HEADER]: signature,
+});
+
+export const publicDelivery = (delivery: Delivery, attempts: Attempt[]) => ({
+  id: delivery.id,
+  eventId: delivery.eventId,
+  url: delivery.url,
+  status: deliveryState(delivery),
+  nextAttemptAt:
+    deliveryState(delivery) === 'pending' && delivery.nextAttemptAt !== null
+      ? new Date(delivery.nextAttemptAt).toISOString()
+      : null,
+  createdAt: delivery.createdAt,
+  updatedAt: delivery.updatedAt,
+  attempts: attempts.map((attempt) => ({
+    id: attempt.id,
+    attemptedAt: attempt.attemptedAt,
+    url: attempt.url ?? delivery.url,
+    signature: attempt.signature,
+    statusCode: attempt.statusCode,
+    error: attempt.error,
+    durationMs: attempt.durationMs,
+    responseBody: attempt.responseBody,
+  })),
+});
+
+/** Network errors from `fetch` hide the useful message in `cause`, sometimes one per address. */
+const describeError = (caught: unknown) => {
+  if (!(caught instanceof Error)) {
+    return 'request failed';
+  }
+  const { cause } = caught;
+  if (cause instanceof AggregateError && cause.errors.length > 0) {
+    return cause.errors
+      .map((error: unknown) => (error instanceof Error ? error.message : String(error)))
+      .join('; ');
+  }
+  if (cause instanceof Error && cause.message) {
+    return cause.message;
+  }
+  return caught.message || caught.name;
+};
+
+/** Reads at most `RESPONSE_BODY_LIMIT_BYTES`, then drops the rest of the stream. */
+const readBodyStart = async (response: Response) => {
+  if (!response.body) {
+    return '';
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (size < RESPONSE_BODY_LIMIT_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      chunks.push(value);
+      size += value.byteLength;
+    }
+  } catch {
+    // Keep what was read before the stream failed.
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  return new TextDecoder().decode(
+    Buffer.concat(chunks).subarray(0, RESPONSE_BODY_LIMIT_BYTES),
+  );
+};
 
 export class WebhookDispatcher {
   private readonly store: Store;
@@ -99,34 +181,26 @@ export class WebhookDispatcher {
 
     const body = serializeEvent(event);
     const startedAt = this.now();
+    const signature = signPayload(
+      this.config.webhookSecret,
+      body,
+      Math.floor(startedAt / 1000),
+    );
     let statusCode: number | null = null;
+    let responseBody: string | null = null;
     let error: string | null = null;
 
     try {
       const response = await this.fetch(delivery.url, {
         method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'user-agent': 'PayFlow-Webhooks/1.0',
-          'payflow-event-id': event.id,
-          [SIGNATURE_HEADER]: signPayload(
-            this.config.webhookSecret,
-            body,
-            Math.floor(startedAt / 1000),
-          ),
-        },
+        headers: webhookHeaders(event.id, signature),
         body,
         signal: AbortSignal.timeout(TIMEOUT_MS),
       });
       statusCode = response.status;
-      await response.body?.cancel();
+      responseBody = await readBodyStart(response);
     } catch (caught) {
-      error =
-        caught instanceof Error
-          ? caught.cause instanceof Error
-            ? caught.cause.message
-            : caught.message
-          : 'request failed';
+      error = describeError(caught);
     }
 
     const attemptCount = delivery.attemptCount + 1;
@@ -139,9 +213,12 @@ export class WebhookDispatcher {
       id: newId('WA'),
       deliveryId: delivery.id,
       attemptedAt: new Date(startedAt).toISOString(),
+      url: delivery.url,
+      signature,
       statusCode,
-      error: error ?? (succeeded ? null : `HTTP ${statusCode}`),
+      error,
       durationMs: this.now() - startedAt,
+      responseBody,
     });
     this.store.saveDelivery({
       ...delivery,

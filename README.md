@@ -1,7 +1,8 @@
 # PayFlow sandbox
 
 Sandbox of the PayFlow payment API: bank debit mandates, charges and signed webhooks, with
-accelerated time and test IBANs. API reference: [docs/api.md](docs/api.md).
+accelerated time and test IBANs. API reference: [docs/api.md](docs/api.md), also served at
+http://localhost:4010/docs.
 
 ## Start
 
@@ -18,7 +19,8 @@ With Docker:
 docker compose up
 ```
 
-The server listens on http://localhost:4010, with a read-only dashboard at
+The server listens on http://localhost:4010, with the documentation at
+http://localhost:4010/docs and a dashboard of mandates, charges and webhook deliveries at
 http://localhost:4010/dashboard. State is kept in SQLite (`data/payflow.db`, or the `data`
 volume with Docker).
 

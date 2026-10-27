@@ -88,6 +88,48 @@ const toDelivery = (row: Row): Delivery => ({
   updatedAt: String(row.updated_at),
 });
 
+/** What integrators see: a delivery being sent is still `pending`. */
+export type DeliveryState = 'pending' | 'delivered' | 'failed';
+
+export const DELIVERY_STATES: DeliveryState[] = ['pending', 'delivered', 'failed'];
+
+const STATUSES_BY_STATE: Record<DeliveryState, Delivery['status'][]> = {
+  pending: ['pending', 'sending'],
+  delivered: ['succeeded'],
+  failed: ['failed'],
+};
+
+const stateOf = (status: Delivery['status']) =>
+  DELIVERY_STATES.find((state) => STATUSES_BY_STATE[state].includes(status)) ?? 'pending';
+
+export const deliveryState = (delivery: Delivery) => stateOf(delivery.status);
+
+export type Attempt = {
+  id: string;
+  deliveryId: string;
+  attemptedAt: string;
+  url: string | null;
+  signature: string | null;
+  statusCode: number | null;
+  /** Network error or timeout, when no HTTP response was received. */
+  error: string | null;
+  durationMs: number;
+  /** Start of the response body, `null` without a response. */
+  responseBody: string | null;
+};
+
+const toAttempt = (row: Row): Attempt => ({
+  id: String(row.id),
+  deliveryId: String(row.delivery_id),
+  attemptedAt: String(row.attempted_at),
+  url: str(row.url),
+  signature: str(row.signature),
+  statusCode: num(row.status_code),
+  error: str(row.error),
+  durationMs: Number(row.duration_ms),
+  responseBody: str(row.response_body),
+});
+
 export type Page = { limit: number; startingAfter?: string };
 
 /** Newest first, paginated with the id of the last item of the previous page. */
@@ -328,10 +370,48 @@ export class Store {
       .map(toDelivery);
   }
 
-  listDeliveries(limit: number) {
+  findDelivery(id: string) {
+    const row = this.database
+      .prepare('SELECT * FROM webhook_deliveries WHERE id = ?')
+      .get(id);
+    return row ? toDelivery(row) : null;
+  }
+
+  listDeliveries(filter: { state?: DeliveryState }, limit: number) {
+    const statuses = filter.state ? STATUSES_BY_STATE[filter.state] : [];
+    const condition =
+      statuses.length > 0
+        ? `WHERE status IN (${statuses.map(() => '?').join(', ')})`
+        : '';
     return this.database
-      .prepare('SELECT * FROM webhook_deliveries ORDER BY rowid DESC LIMIT ?')
-      .all(limit)
+      .prepare(
+        `SELECT * FROM webhook_deliveries ${condition} ORDER BY rowid DESC LIMIT ?`,
+      )
+      .all(...statuses, limit)
+      .map(toDelivery);
+  }
+
+  countDeliveries() {
+    const counts: Record<DeliveryState, number> = { pending: 0, delivered: 0, failed: 0 };
+    const rows = this.database
+      .prepare('SELECT status, COUNT(*) AS count FROM webhook_deliveries GROUP BY status')
+      .all();
+    for (const row of rows) {
+      counts[stateOf(String(row.status) as Delivery['status'])] += Number(row.count);
+    }
+    return counts;
+  }
+
+  listEventDeliveries(eventId: string, pagination: Page) {
+    const { sql, values } = page(
+      'webhook_deliveries',
+      'event_id = ?',
+      [eventId],
+      pagination,
+    );
+    return this.database
+      .prepare(sql)
+      .all(...values)
       .map(toDelivery);
   }
 
@@ -344,27 +424,32 @@ export class Store {
       .run(now);
   }
 
-  insertAttempt(attempt: {
-    id: string;
-    deliveryId: string;
-    attemptedAt: string;
-    statusCode: number | null;
-    error: string | null;
-    durationMs: number;
-  }) {
+  insertAttempt(attempt: Attempt) {
     this.database
       .prepare(
-        `INSERT INTO webhook_attempts (id, delivery_id, attempted_at, status_code, error, duration_ms)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO webhook_attempts (id, delivery_id, attempted_at, url, signature, status_code,
+           error, duration_ms, response_body)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         attempt.id,
         attempt.deliveryId,
         attempt.attemptedAt,
+        attempt.url,
+        attempt.signature,
         attempt.statusCode,
         attempt.error,
         attempt.durationMs,
+        attempt.responseBody,
       );
+  }
+
+  /** Oldest first. */
+  listAttempts(deliveryId: string) {
+    return this.database
+      .prepare('SELECT * FROM webhook_attempts WHERE delivery_id = ? ORDER BY rowid')
+      .all(deliveryId)
+      .map(toAttempt);
   }
 
   findIdempotentResponse(key: string, notBefore: number) {

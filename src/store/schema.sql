@@ -56,14 +56,21 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
   updated_at TEXT NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS webhook_deliveries_event_id_idx ON webhook_deliveries (event_id);
+
 CREATE TABLE IF NOT EXISTS webhook_attempts (
   id TEXT PRIMARY KEY,
   delivery_id TEXT NOT NULL REFERENCES webhook_deliveries (id),
   attempted_at TEXT NOT NULL,
+  url TEXT,
+  signature TEXT,
   status_code INTEGER,
   error TEXT,
-  duration_ms INTEGER NOT NULL
+  duration_ms INTEGER NOT NULL,
+  response_body TEXT
 );
+
+CREATE INDEX IF NOT EXISTS webhook_attempts_delivery_id_idx ON webhook_attempts (delivery_id);
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
   key TEXT PRIMARY KEY,
